@@ -125,7 +125,8 @@ export class SessionIndex {
     let filesScanned = 0;
     let turnsAdded = 0;
 
-    // Walk sessions directory
+    // Collect all files to process
+    const filesToIndex: string[] = [];
     const projectDirs = await this.listProjectDirs();
 
     for (const projectDir of projectDirs) {
@@ -136,15 +137,17 @@ export class SessionIndex {
       } catch {
         continue;
       }
-
       for (const entry of entries) {
         if (!entry.endsWith('.jsonl')) continue;
-
-        const filePath = join(fullDir, entry);
-        const added = await this.indexFile(filePath);
-        turnsAdded += added;
-        filesScanned++;
+        filesToIndex.push(join(fullDir, entry));
       }
+    }
+
+    // Process all files — indexFile uses internal transactions per file
+    for (const filePath of filesToIndex) {
+      const added = await this.indexFile(filePath);
+      turnsAdded += added;
+      filesScanned++;
     }
 
     return { filesScanned, turnsAdded };
@@ -494,7 +497,7 @@ export class SessionIndex {
       rank: number;
     }>;
 
-    return rows.map(row => {
+    const results = rows.map(row => {
       // Retrieve the actual turn text via pread from the original file
       const text = this.readBytes(row.file_path, row.byte_offset, row.byte_length);
 
@@ -518,17 +521,43 @@ export class SessionIndex {
 
       return result;
     });
+
+    // Close cached file descriptors after search completes
+    this.closeFdCache();
+    return results;
+  }
+
+  /**
+   * File descriptor cache for batch reads within a single search.
+   * Avoids repeated open/close of the same file.
+   */
+  private fdCache = new Map<string, number>();
+
+  private getFd(filePath: string): number {
+    let fd = this.fdCache.get(filePath);
+    if (fd === undefined) {
+      fd = openSync(filePath, 'r');
+      this.fdCache.set(filePath, fd);
+    }
+    return fd;
+  }
+
+  private closeFdCache(): void {
+    for (const fd of this.fdCache.values()) {
+      try { closeSync(fd); } catch {}
+    }
+    this.fdCache.clear();
   }
 
   /**
    * Read raw bytes from a file at a specific offset. O(1).
+   * Uses fd cache to avoid repeated open/close for same file.
    */
   readBytes(filePath: string, offset: number, length: number): string {
     try {
-      const fd = openSync(filePath, 'r');
+      const fd = this.getFd(filePath);
       const buffer = Buffer.alloc(length);
       readSync(fd, buffer, 0, length, offset);
-      closeSync(fd);
       return buffer.toString('utf-8');
     } catch {
       return '';
@@ -537,14 +566,44 @@ export class SessionIndex {
 
   /**
    * Parse raw JSONL lines of a turn back into readable text.
+   * Uses fast pre-filter and truncates large lines before JSON.parse.
    */
   parseTurnText(rawLines: string): string {
-    const lines = rawLines.split('\n').filter(l => l.trim());
+    const lines = rawLines.split('\n');
     const parts: string[] = [];
 
     for (const line of lines) {
+      // Fast pre-filter: skip empty lines and non-message types
+      if (line.length < 20) continue;
+      if (!line.includes('"message"')) continue;
+
       try {
-        const obj = JSON.parse(line);
+        // For large tool results, we only need the beginning for display.
+        // Parse a truncated version to avoid the full JSON.parse cost.
+        let obj;
+        if (line.length > 4000 && line.includes('toolResult')) {
+          // Truncate content arrays in tool results — we only display 300 chars anyway
+          // Find the content field and cap it
+          const truncated = line.slice(0, 4000);
+          // Try to parse; if it fails due to truncation, extract role manually
+          try {
+            obj = JSON.parse(truncated + ']}]}');
+          } catch {
+            try { obj = JSON.parse(truncated + '"}]}]}'); } catch {
+              // Fall back to regex extraction
+              const roleMatch = line.match(/"role":"(\w+)"/);
+              if (roleMatch?.[1] === 'toolResult') {
+                const textMatch = line.match(/"text":"([^"]{0,400})/);
+                const snippet = textMatch?.[1] ?? '';
+                parts.push(`[tool result]: ${snippet}...\n[Showing 300 of ${line.length} chars. Full output in source file above.]`);
+              }
+              continue;
+            }
+          }
+        } else {
+          obj = JSON.parse(line);
+        }
+
         if (obj.type !== 'message') continue;
 
         const role = obj.message?.role;
@@ -571,6 +630,22 @@ export class SessionIndex {
   /**
    * Get ±N surrounding turns for context.
    */
+  // Cached prepared statement for context lookups
+  private _stmtSurrounding: ReturnType<typeof this.db.prepare> | null = null;
+  private get stmtSurrounding() {
+    if (!this._stmtSurrounding) {
+      this._stmtSurrounding = this.db.prepare(`
+        SELECT rowid, file_path, session_id, turn_index, byte_offset, byte_length, timestamp
+        FROM turn_offsets
+        WHERE file_path = ?
+          AND turn_index BETWEEN ? AND ?
+          AND turn_index != ?
+        ORDER BY turn_index
+      `);
+    }
+    return this._stmtSurrounding;
+  }
+
   private getSurroundingTurns(
     filePath: string,
     turnIndex: number,
@@ -579,14 +654,7 @@ export class SessionIndex {
     const minTurn = Math.max(0, turnIndex - range);
     const maxTurn = turnIndex + range;
 
-    const rows = this.db.prepare(`
-      SELECT rowid, file_path, session_id, turn_index, byte_offset, byte_length, timestamp
-      FROM turn_offsets
-      WHERE file_path = ?
-        AND turn_index BETWEEN ? AND ?
-        AND turn_index != ?
-      ORDER BY turn_index
-    `).all(filePath, minTurn, maxTurn, turnIndex) as Array<{
+    const rows = this.stmtSurrounding.all(filePath, minTurn, maxTurn, turnIndex) as Array<{
       rowid: number;
       file_path: string;
       session_id: string;
