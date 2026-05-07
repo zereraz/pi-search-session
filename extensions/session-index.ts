@@ -375,11 +375,30 @@ export class SessionIndex {
    * - ThinkingContent → skipped (internal reasoning)
    * - ImageContent → skipped (binary)
    */
+  /**
+   * Expand camelCase identifiers so both the compound and parts are searchable.
+   * "readFileSync" → "readFileSync read File Sync"
+   * "SessionIndex" → "SessionIndex Session Index"
+   * "getHTTPResponse" → "getHTTPResponse get HTTP Response"
+   * Only expands tokens ≥6 chars with at least one case transition.
+   */
+  private expandCamelCase(text: string): string {
+    return text.replace(/\b([a-zA-Z]{6,})\b/g, (match) => {
+      // Must have at least one lowercase→uppercase transition
+      if (!/[a-z][A-Z]/.test(match) && !/[A-Z]{2,}[a-z]/.test(match)) return match;
+      const parts = match
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+      if (parts === match) return match;
+      return `${match} ${parts}`;
+    });
+  }
+
   private extractText(content: unknown): string {
     if (!content) return '';
 
     // UserMessage can have string content
-    if (typeof content === 'string') return content;
+    if (typeof content === 'string') return this.expandCamelCase(content);
 
     if (Array.isArray(content)) {
       const texts: string[] = [];
@@ -402,7 +421,7 @@ export class SessionIndex {
           // Skip: unknown types — safe to ignore
         }
       }
-      return texts.join('\n');
+      return this.expandCamelCase(texts.join('\n'));
     }
 
     return '';
@@ -429,8 +448,8 @@ export class SessionIndex {
     const limit = options?.limit ?? 10;
     const contextTurns = options?.contextTurns ?? 2;
 
-    // Sanitize query for FTS5
-    const ftsQuery = this.sanitizeFtsQuery(query);
+    // Expand camelCase in query, then sanitize for FTS5
+    const ftsQuery = this.sanitizeFtsQuery(this.expandCamelCase(query));
     if (!ftsQuery) return [];
 
     let sql = `
