@@ -24,7 +24,7 @@ pi install github:zereraz/pi-search-session
 | `project` | Filter by project directory name |
 | `context_turns` | Surrounding turns for context (default: 1) |
 
-Each result includes the source file path for deeper inspection.
+Each result includes the source file path, so the agent can `read` the original JSONL file directly for full untruncated content (tool results are previewed at 300 chars in search output).
 
 ## Design
 
