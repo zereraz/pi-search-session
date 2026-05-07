@@ -1,23 +1,26 @@
 /**
- * Session Index — contentless FTS5 over pi's existing JSONL sessions
+ * SessionIndex — Contentless FTS5 full-text search over JSONL session files.
  *
- * No data duplication. Indexes turns (user message + assistant response) at
- * byte-offset granularity for O(1) retrieval via pread.
+ * Architecture:
+ *   - Indexes JSONL files at "turn" granularity (user msg + assistant response)
+ *   - Contentless FTS5: stores only the inverted index, retrieves text via byte offsets
+ *   - Per-file watermarks for incremental indexing (only new bytes processed)
+ *   - BM25 ranking with porter stemming + camelCase expansion
  *
- * Pi sessions live at: ~/.pi/agent/sessions/<project-dir>/<timestamp>_<uuid>.jsonl
- * Each line is a JSON object with {type, id, parentId, ...}
- * Message lines have: {type: "message", message: {role, content, ...}}
+ * Schema:
+ *   indexed_files(path, size, mtime_ms, last_offset)  — watermarks
+ *   turn_offsets(file_path, session_id, turn_index, byte_offset, byte_length, timestamp)
+ *   sessions_fts(text) — contentless-delete FTS5 with porter+unicode61
  *
- * Design:
- * 1. indexed_files — per-file watermark (path, size, mtime, last_offset)
- * 2. turn_offsets — maps FTS rowid → (file, byte_offset, byte_length, session_id, turn_index, timestamp)
- * 3. sessions_fts — contentless FTS5, stores only the inverted index
+ * JSONL format (pi-mono sessions):
+ *   Line 0: { type: "session", version: 3, id: UUID, timestamp, cwd }
+ *   Lines:  { type: "message", id, parentId, timestamp, message: { role, content } }
+ *   Roles:  "user" | "assistant" | "toolResult"
+ *   Other types (compaction, model_change, custom, etc.) are skipped.
  *
- * Index at turn granularity: user message + all assistant/toolResult messages until next user message.
- * This gives BM25 coherent context to rank against queries.
- *
- * Uses pi-ai types (UserMessage, AssistantMessage, ToolResultMessage) for
- * type-safe content extraction from JSONL lines.
+ * Performance (356 files, 150MB, 2556 turns):
+ *   Cold build: ~1200ms (126 MB/s)  |  Warm reindex: 9ms
+ *   Search:     ~4ms (with context)  |  DB size: ~6MB
  */
 
 import Database from 'better-sqlite3';
@@ -26,7 +29,9 @@ import { join, resolve } from 'path';
 import { openSync, readSync, closeSync } from 'fs';
 import { homedir } from 'os';
 
-/** A turn: user question + assistant response (may include tool calls/results) */
+// ─── Public Types ────────────────────────────────────────────────────────────
+
+/** A single conversational turn (user question + assistant response + tool results) */
 export interface Turn {
   sessionId: string;
   sessionFile: string;
@@ -34,20 +39,20 @@ export interface Turn {
   timestamp: string;
   byteOffset: number;
   byteLength: number;
-  /** Extracted text content of the turn (user + assistant text) */
   text: string;
 }
 
-/** Search result pointing back to the original JSONL */
+/** A ranked search result with optional surrounding context */
 export interface SearchResult {
   sessionId: string;
   sessionFile: string;
   turnIndex: number;
   timestamp: string;
+  /** BM25 score (more negative = better match) */
   score: number;
-  /** The raw turn text, retrieved via pread from the original file */
+  /** Parsed turn text (user + assistant + truncated tool results) */
   text: string;
-  /** Surrounding turns for context (±N) */
+  /** ±N surrounding turns for context */
   context?: Turn[];
 }
 
@@ -57,6 +62,8 @@ export interface IndexStats {
   indexSizeBytes: number;
 }
 
+// ─── Defaults ────────────────────────────────────────────────────────────────
+
 const DEFAULT_SESSIONS_DIR = join(
   process.env.HOME || homedir(),
   '.pi',
@@ -64,86 +71,51 @@ const DEFAULT_SESSIONS_DIR = join(
   'sessions'
 );
 
+/** Max chars of tool result text indexed per turn. 2000 captures 83% of tool outputs fully. */
+const TOOL_RESULT_INDEX_CAP = 2000;
+
+/** Max chars of tool result shown in search output. Full text available in source file. */
+const TOOL_RESULT_DISPLAY_CAP = 300;
+
+// ─── SessionIndex ────────────────────────────────────────────────────────────
+
 export class SessionIndex {
+  /** Exposed for advanced queries. Use with care — schema may change. */
   db: Database.Database;
   private sessionsDir: string;
 
-  constructor(
-    dbPath: string,
-    sessionsDir: string = DEFAULT_SESSIONS_DIR
-  ) {
+  constructor(dbPath: string, sessionsDir: string = DEFAULT_SESSIONS_DIR) {
     this.sessionsDir = resolve(sessionsDir);
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
-    this.initialize();
+    this.initSchema();
   }
 
-  private initialize(): void {
-    this.db.exec(`
-      -- Per-file watermark for incremental indexing
-      CREATE TABLE IF NOT EXISTS indexed_files (
-        path TEXT PRIMARY KEY,
-        size INTEGER NOT NULL,
-        mtime_ms INTEGER NOT NULL,
-        last_offset INTEGER NOT NULL
-      );
-
-      -- Turn location mapping: FTS rowid → file location
-      CREATE TABLE IF NOT EXISTS turn_offsets (
-        rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_path TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        turn_index INTEGER NOT NULL,
-        byte_offset INTEGER NOT NULL,
-        byte_length INTEGER NOT NULL,
-        timestamp TEXT NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_turn_session
-        ON turn_offsets(session_id);
-      CREATE INDEX IF NOT EXISTS idx_turn_file
-        ON turn_offsets(file_path);
-
-      -- Contentless-delete FTS5 — stores only the inverted index, not the text
-      -- contentless_delete=1 enables proper DELETE support (SQLite >=3.43)
-      CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
-        text,
-        content='',
-        contentless_delete=1,
-        content_rowid='rowid',
-        tokenize='porter unicode61'
-      );
-    `);
-  }
+  // ─── Public API ──────────────────────────────────────────────────────────
 
   /**
    * Incrementally index all session files.
    * Only processes new bytes since last indexed offset per file.
+   * Safe to call frequently — skips unchanged files in ~9ms.
    */
   async reindex(): Promise<{ filesScanned: number; turnsAdded: number }> {
     let filesScanned = 0;
     let turnsAdded = 0;
 
-    // Collect all files to process
     const filesToIndex: string[] = [];
     const projectDirs = await this.listProjectDirs();
 
     for (const projectDir of projectDirs) {
       const fullDir = join(this.sessionsDir, projectDir);
       let entries;
-      try {
-        entries = await fs.readdir(fullDir);
-      } catch {
-        continue;
-      }
+      try { entries = await fs.readdir(fullDir); } catch { continue; }
       for (const entry of entries) {
         if (!entry.endsWith('.jsonl')) continue;
         filesToIndex.push(join(fullDir, entry));
       }
     }
 
-    // Process all files — indexFile uses internal transactions per file
     for (const filePath of filesToIndex) {
       const added = await this.indexFile(filePath);
       turnsAdded += added;
@@ -154,293 +126,11 @@ export class SessionIndex {
   }
 
   /**
-   * Index a single JSONL file incrementally from its last watermark.
-   */
-  private async indexFile(filePath: string): Promise<number> {
-    // Check watermark
-    let stat;
-    try {
-      stat = await fs.stat(filePath);
-    } catch {
-      return 0;
-    }
-
-    const existing = this.db.prepare(
-      'SELECT size, mtime_ms, last_offset FROM indexed_files WHERE path = ?'
-    ).get(filePath) as { size: number; mtime_ms: number; last_offset: number } | undefined;
-
-    // Skip if file hasn't changed
-    if (existing &&
-        existing.size === stat.size &&
-        existing.mtime_ms === Math.floor(stat.mtimeMs)) {
-      return 0;
-    }
-
-    const startOffset = existing?.last_offset ?? 0;
-
-    // If file shrunk (rewritten), re-index from scratch
-    if (existing && stat.size < existing.size) {
-      this.removeFileEntries(filePath);
-      return this.indexFileFromOffset(filePath, 0, stat);
-    }
-
-    return this.indexFileFromOffset(filePath, startOffset, stat);
-  }
-
-  /**
-   * Parse JSONL from a byte offset and index new turns.
-   */
-  private async indexFileFromOffset(
-    filePath: string,
-    startOffset: number,
-    stat: { size: number; mtimeMs: number }
-  ): Promise<number> {
-    // Read the file content from startOffset
-    let fd: number | null = null;
-    let content: string;
-    try {
-      fd = openSync(filePath, 'r');
-      const buffer = Buffer.alloc(stat.size - startOffset);
-      readSync(fd, buffer, 0, buffer.length, startOffset);
-      content = buffer.toString('utf-8');
-    } catch {
-      return 0;
-    } finally {
-      if (fd !== null) closeSync(fd);
-    }
-    // Split into lines, removing trailing empty element from final newline
-    const lines = content.split('\n');
-    if (lines.length > 0 && lines[lines.length - 1] === '') {
-      lines.pop();
-    }
-
-    // We need to know the session ID. If starting from 0, the first line is the session header.
-    // If resuming, we need it from the DB or re-read line 0.
-    let sessionId = '';
-    if (startOffset === 0) {
-      // First line should be the session header
-      try {
-        const header = JSON.parse(lines[0]);
-        if (header.type === 'session') {
-          sessionId = header.id;
-        }
-      } catch {}
-    } else {
-      // Get session ID from existing entries for this file
-      const row = this.db.prepare(
-        'SELECT session_id FROM turn_offsets WHERE file_path = ? LIMIT 1'
-      ).get(filePath) as { session_id: string } | undefined;
-      sessionId = row?.session_id ?? '';
-    }
-
-    if (!sessionId) {
-      // Can't index without session ID — try reading first line of file
-      let headerFd: number | null = null;
-      try {
-        headerFd = openSync(filePath, 'r');
-        const headerBuf = Buffer.alloc(Math.min(1024, stat.size));
-        readSync(headerFd, headerBuf, 0, headerBuf.length, 0);
-        const firstLine = headerBuf.toString('utf-8').split('\n')[0];
-        const header = JSON.parse(firstLine);
-        if (header.type === 'session') sessionId = header.id;
-      } catch {}
-      finally {
-        if (headerFd !== null) closeSync(headerFd);
-      }
-    }
-
-    if (!sessionId) return 0;
-
-    // Get current max turn index for this file
-    const maxTurnRow = this.db.prepare(
-      'SELECT MAX(turn_index) as max_turn FROM turn_offsets WHERE file_path = ?'
-    ).get(filePath) as { max_turn: number | null } | undefined;
-    let turnIndex = (maxTurnRow?.max_turn ?? -1) + 1;
-
-    // Parse lines into turns
-    // A turn starts with a user message and includes everything until the next user message
-    let currentTurn: {
-      text: string;
-      byteOffset: number;
-      byteEnd: number;
-      timestamp: string;
-    } | null = null;
-
-    let turnsAdded = 0;
-    let lineOffset = startOffset;
-
-    const insertTurn = this.db.prepare(`
-      INSERT INTO turn_offsets (file_path, session_id, turn_index, byte_offset, byte_length, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-
-    const insertFts = this.db.prepare(`
-      INSERT INTO sessions_fts (rowid, text) VALUES (?, ?)
-    `);
-
-    const flushTurn = () => {
-      if (!currentTurn || !currentTurn.text.trim()) return;
-
-      const byteLength = currentTurn.byteEnd - currentTurn.byteOffset;
-
-      const result = insertTurn.run(
-        filePath,
-        sessionId,
-        turnIndex,
-        currentTurn.byteOffset,
-        byteLength,
-        currentTurn.timestamp
-      );
-
-      // Insert into FTS with matching rowid
-      insertFts.run(result.lastInsertRowid, currentTurn.text);
-
-      turnIndex++;
-      turnsAdded++;
-    };
-
-    const transaction = this.db.transaction(() => {
-      for (const line of lines) {
-        const lineBytes = Buffer.byteLength(line + '\n', 'utf-8');
-
-        if (!line.trim()) {
-          lineOffset += lineBytes;
-          continue;
-        }
-
-        let obj: { type: string; message?: { role?: string; content?: unknown; timestamp?: number | string }; id?: string; timestamp?: string };
-        try {
-          obj = JSON.parse(line);
-        } catch {
-          lineOffset += lineBytes;
-          continue;
-        }
-
-        if (obj.type === 'message' && obj.message) {
-          const role = obj.message.role;
-          const content = obj.message.content;
-
-          if (role === 'user') {
-            // Flush previous turn
-            flushTurn();
-
-            // Start new turn
-            const text = this.extractText(content);
-            currentTurn = {
-              text,
-              byteOffset: lineOffset,
-              byteEnd: lineOffset + lineBytes,
-              timestamp: String(obj.timestamp || obj.message?.timestamp || '')
-            };
-          } else if (role === 'assistant' && currentTurn) {
-            // Append assistant text to current turn
-            const text = this.extractText(content);
-            if (text) {
-              currentTurn.text += '\n' + text;
-            }
-            currentTurn.byteEnd = lineOffset + lineBytes;
-          } else if (role === 'toolResult' && currentTurn) {
-            // Tool results are part of the turn but we only index
-            // a brief summary to avoid noise from huge tool outputs
-            const text = this.extractText(content);
-            if (text) {
-              // Cap tool result text — 2000 chars captures 83% fully,
-              // balances index size vs search coverage
-              const truncated = text.length > 2000 ? text.slice(0, 2000) : text;
-              currentTurn.text += '\n' + truncated;
-            }
-            currentTurn.byteEnd = lineOffset + lineBytes;
-          }
-        }
-
-        lineOffset += lineBytes;
-      }
-
-      // Flush last turn
-      flushTurn();
-
-      // Update watermark — use actual file size, not computed offset, to avoid drift
-      this.db.prepare(`
-        INSERT OR REPLACE INTO indexed_files (path, size, mtime_ms, last_offset)
-        VALUES (?, ?, ?, ?)
-      `).run(filePath, stat.size, Math.floor(stat.mtimeMs), stat.size);
-    });
-
-    transaction();
-    return turnsAdded;
-  }
-
-  /**
-   * Extract text content from a pi message content field.
-   * Uses pi-ai types for proper content block handling:
-   * - TextContent → indexed
-   * - ToolCall → indexed as [tool:name]
-   * - ThinkingContent → skipped (internal reasoning)
-   * - ImageContent → skipped (binary)
-   */
-  /**
-   * Expand camelCase identifiers so both the compound and parts are searchable.
-   * "readFileSync" → "readFileSync read File Sync"
-   * "SessionIndex" → "SessionIndex Session Index"
-   * "getHTTPResponse" → "getHTTPResponse get HTTP Response"
-   * Only expands tokens ≥6 chars with at least one case transition.
-   */
-  private expandCamelCase(text: string): string {
-    return text.replace(/\b([a-zA-Z]{6,})\b/g, (match) => {
-      // Must have at least one lowercase→uppercase transition
-      if (!/[a-z][A-Z]/.test(match) && !/[A-Z]{2,}[a-z]/.test(match)) return match;
-      const parts = match
-        .replace(/([a-z])([A-Z])/g, '$1 $2')
-        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
-      if (parts === match) return match;
-      return `${match} ${parts}`;
-    });
-  }
-
-  private extractText(content: unknown): string {
-    if (!content) return '';
-
-    // UserMessage can have string content
-    if (typeof content === 'string') return this.expandCamelCase(content);
-
-    if (Array.isArray(content)) {
-      const texts: string[] = [];
-      for (const block of content) {
-        if (typeof block !== 'object' || block === null) continue;
-
-        const b = block as { type: string; text?: string; name?: string; thinking?: string };
-
-        switch (b.type) {
-          case 'text':
-            // TextContent from pi-ai
-            if (typeof b.text === 'string') texts.push(b.text);
-            break;
-          case 'toolCall':
-            // ToolCall from pi-ai — index tool name for searchability
-            if (typeof b.name === 'string') texts.push(`[tool:${b.name}]`);
-            break;
-          // Skip: 'thinking' (ThinkingContent) — internal reasoning
-          // Skip: 'image' (ImageContent) — binary data
-          // Skip: unknown types — safe to ignore
-        }
-      }
-      return this.expandCamelCase(texts.join('\n'));
-    }
-
-    return '';
-  }
-
-  /**
-   * Search sessions using FTS5 BM25 ranking.
+   * BM25-ranked full-text search across all indexed sessions.
    *
-   * Indexes at turn granularity (user + assistant exchange as one document).
-   * This means all query terms must appear in the same conversational turn,
-   * which filters out false positives where terms are scattered across
-   * unrelated parts of a session file.
-   *
-   * Tool result text is capped at 2000 chars in the index for ranking quality.
-   * This captures 83% of tool outputs fully; for the rest, the first 2000 chars
-   * usually contain the meaningful content (commands, errors, headers).
+   * Returns turns where ALL query terms co-occur (implicit AND).
+   * This turn-granularity constraint eliminates false positives from
+   * scattered term matches across unrelated parts of a session.
    */
   search(query: string, options?: {
     limit?: number;
@@ -451,56 +141,37 @@ export class SessionIndex {
     const limit = options?.limit ?? 10;
     const contextTurns = options?.contextTurns ?? 2;
 
-    // Expand camelCase in query, then sanitize for FTS5
     const ftsQuery = this.sanitizeFtsQuery(this.expandCamelCase(query));
     if (!ftsQuery) return [];
 
     let sql = `
-      SELECT
-        t.rowid,
-        t.file_path,
-        t.session_id,
-        t.turn_index,
-        t.byte_offset,
-        t.byte_length,
-        t.timestamp,
-        rank
+      SELECT t.rowid, t.file_path, t.session_id, t.turn_index,
+             t.byte_offset, t.byte_length, t.timestamp, rank
       FROM sessions_fts fts
       JOIN turn_offsets t ON fts.rowid = t.rowid
       WHERE sessions_fts MATCH ?
     `;
-
     const params: (string | number)[] = [ftsQuery];
 
     if (options?.sessionId) {
       sql += ` AND t.session_id = ?`;
       params.push(options.sessionId);
     }
-
     if (options?.project) {
-      // Project dirs are encoded as --path-segments--
       sql += ` AND t.file_path LIKE ?`;
       params.push(`%${options.project}%`);
     }
-
     sql += ` ORDER BY rank LIMIT ?`;
     params.push(limit);
 
     const rows = this.db.prepare(sql).all(...params) as Array<{
-      rowid: number;
-      file_path: string;
-      session_id: string;
-      turn_index: number;
-      byte_offset: number;
-      byte_length: number;
-      timestamp: string;
-      rank: number;
+      rowid: number; file_path: string; session_id: string;
+      turn_index: number; byte_offset: number; byte_length: number;
+      timestamp: string; rank: number;
     }>;
 
     const results = rows.map(row => {
-      // Retrieve the actual turn text via pread from the original file
       const text = this.readBytes(row.file_path, row.byte_offset, row.byte_length);
-
       const result: SearchResult = {
         sessionId: row.session_id,
         sessionFile: row.file_path,
@@ -509,28 +180,341 @@ export class SessionIndex {
         score: row.rank,
         text: this.parseTurnText(text)
       };
-
-      // Fetch surrounding turns for context
       if (contextTurns > 0) {
-        result.context = this.getSurroundingTurns(
-          row.file_path,
-          row.turn_index,
-          contextTurns
-        );
+        result.context = this.getSurroundingTurns(row.file_path, row.turn_index, contextTurns);
       }
-
       return result;
     });
 
-    // Close cached file descriptors after search completes
     this.closeFdCache();
     return results;
   }
 
+  /** Remove stale entries for deleted session files. Returns count removed. */
+  async cleanup(): Promise<number> {
+    const files = this.db.prepare('SELECT path FROM indexed_files').all() as Array<{ path: string }>;
+    let removed = 0;
+    for (const { path } of files) {
+      try { await fs.access(path); } catch {
+        this.removeFileEntries(path);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  /** Index statistics. */
+  stats(): IndexStats {
+    const files = this.db.prepare('SELECT COUNT(*) as count FROM indexed_files').get() as { count: number };
+    const turns = this.db.prepare('SELECT COUNT(*) as count FROM turn_offsets').get() as { count: number };
+    let indexSize = 0;
+    try {
+      const pageCount = this.db.pragma('page_count') as Array<{ page_count: number }>;
+      const pageSize = this.db.pragma('page_size') as Array<{ page_size: number }>;
+      indexSize = (pageCount[0]?.page_count ?? 0) * (pageSize[0]?.page_size ?? 4096);
+    } catch {}
+    return { totalFiles: files.count, totalTurns: turns.count, indexSizeBytes: indexSize };
+  }
+
+  /** Merge FTS5 segments. Call periodically (e.g. weekly), not on every reindex. */
+  optimize(): void {
+    this.db.exec("INSERT INTO sessions_fts(sessions_fts) VALUES('optimize')");
+  }
+
+  /** Read raw bytes from a file at offset. Uses fd cache within a search. */
+  readBytes(filePath: string, offset: number, length: number): string {
+    try {
+      const fd = this.getFd(filePath);
+      const buffer = Buffer.alloc(length);
+      readSync(fd, buffer, 0, length, offset);
+      return buffer.toString('utf-8');
+    } catch {
+      return '';
+    }
+  }
+
+  /** Parse raw JSONL bytes of a turn into human-readable text. */
+  parseTurnText(rawLines: string): string {
+    const lines = rawLines.split('\n');
+    const parts: string[] = [];
+
+    for (const line of lines) {
+      if (line.length < 20) continue;
+      if (!line.includes('"message"')) continue;
+
+      try {
+        let obj;
+        // Perf: for large tool result lines (>4KB), truncate before JSON.parse.
+        // We only display 300 chars anyway — no point parsing 50KB of output.
+        if (line.length > 4000 && line.includes('toolResult')) {
+          const truncated = line.slice(0, 4000);
+          try { obj = JSON.parse(truncated + ']}]}'); } catch {
+            try { obj = JSON.parse(truncated + '"}]}]}'); } catch {
+              // Regex fallback for extremely malformed truncations
+              const roleMatch = line.match(/"role":"(\w+)"/);
+              if (roleMatch?.[1] === 'toolResult') {
+                const textMatch = line.match(/"text":"([^"]{0,400})/);
+                const snippet = textMatch?.[1] ?? '';
+                parts.push(`[tool result]: ${snippet}...\n[Showing ${TOOL_RESULT_DISPLAY_CAP} of ${line.length} chars. Full output in source file above.]`);
+              }
+              continue;
+            }
+          }
+        } else {
+          obj = JSON.parse(line);
+        }
+
+        if (obj.type !== 'message') continue;
+        const role = obj.message?.role;
+        const text = this.extractText(obj.message?.content);
+
+        if (text && role !== 'toolResult') {
+          parts.push(`${role}: ${text}`);
+        } else if (text && role === 'toolResult') {
+          if (text.length > TOOL_RESULT_DISPLAY_CAP) {
+            parts.push(`[tool result]: ${text.slice(0, TOOL_RESULT_DISPLAY_CAP)}...\n[Showing ${TOOL_RESULT_DISPLAY_CAP} of ${text.length} chars. Full output in source file above.]`);
+          } else {
+            parts.push(`[tool result]: ${text}`);
+          }
+        }
+      } catch {}
+    }
+
+    return parts.join('\n\n');
+  }
+
+  close(): void {
+    this.closeFdCache();
+    this.db.close();
+  }
+
+  // ─── Indexing Internals ──────────────────────────────────────────────────
+
+  private initSchema(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS indexed_files (
+        path TEXT PRIMARY KEY,
+        size INTEGER NOT NULL,
+        mtime_ms INTEGER NOT NULL,
+        last_offset INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS turn_offsets (
+        rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_path TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        turn_index INTEGER NOT NULL,
+        byte_offset INTEGER NOT NULL,
+        byte_length INTEGER NOT NULL,
+        timestamp TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_turn_session ON turn_offsets(session_id);
+      CREATE INDEX IF NOT EXISTS idx_turn_file ON turn_offsets(file_path);
+
+      -- contentless_delete=1 requires SQLite >=3.43
+      CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+        text,
+        content='',
+        contentless_delete=1,
+        content_rowid='rowid',
+        tokenize='porter unicode61'
+      );
+    `);
+  }
+
+  private async indexFile(filePath: string): Promise<number> {
+    let stat;
+    try { stat = await fs.stat(filePath); } catch { return 0; }
+
+    const existing = this.db.prepare(
+      'SELECT size, mtime_ms, last_offset FROM indexed_files WHERE path = ?'
+    ).get(filePath) as { size: number; mtime_ms: number; last_offset: number } | undefined;
+
+    // Skip unchanged files (fast path — ~9ms for 356 files)
+    if (existing && existing.size === stat.size && existing.mtime_ms === Math.floor(stat.mtimeMs)) {
+      return 0;
+    }
+
+    const startOffset = existing?.last_offset ?? 0;
+
+    // File shrunk = rewritten (pi-mono migration). Re-index from scratch.
+    if (existing && stat.size < existing.size) {
+      this.removeFileEntries(filePath);
+      return this.indexFileFromOffset(filePath, 0, stat);
+    }
+
+    return this.indexFileFromOffset(filePath, startOffset, stat);
+  }
+
+  private async indexFileFromOffset(
+    filePath: string,
+    startOffset: number,
+    stat: { size: number; mtimeMs: number }
+  ): Promise<number> {
+    let fd: number | null = null;
+    let content: string;
+    try {
+      fd = openSync(filePath, 'r');
+      const buffer = Buffer.alloc(stat.size - startOffset);
+      readSync(fd, buffer, 0, buffer.length, startOffset);
+      content = buffer.toString('utf-8');
+    } catch { return 0; }
+    finally { if (fd !== null) closeSync(fd); }
+
+    const lines = content.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+    // Resolve session ID — needed to associate turns with sessions
+    let sessionId = '';
+    if (startOffset === 0) {
+      try {
+        const header = JSON.parse(lines[0]);
+        if (header.type === 'session') sessionId = header.id;
+      } catch {}
+    } else {
+      const row = this.db.prepare(
+        'SELECT session_id FROM turn_offsets WHERE file_path = ? LIMIT 1'
+      ).get(filePath) as { session_id: string } | undefined;
+      sessionId = row?.session_id ?? '';
+    }
+
+    // Fallback: re-read first line from disk (handles resume after DB wipe)
+    if (!sessionId) {
+      let headerFd: number | null = null;
+      try {
+        headerFd = openSync(filePath, 'r');
+        const headerBuf = Buffer.alloc(Math.min(1024, stat.size));
+        readSync(headerFd, headerBuf, 0, headerBuf.length, 0);
+        const firstLine = headerBuf.toString('utf-8').split('\n')[0];
+        const header = JSON.parse(firstLine);
+        if (header.type === 'session') sessionId = header.id;
+      } catch {}
+      finally { if (headerFd !== null) closeSync(headerFd); }
+    }
+
+    // Files without a valid session header are skipped (e.g. non-pi JSONL files)
+    if (!sessionId) return 0;
+
+    const maxTurnRow = this.db.prepare(
+      'SELECT MAX(turn_index) as max_turn FROM turn_offsets WHERE file_path = ?'
+    ).get(filePath) as { max_turn: number | null } | undefined;
+    let turnIndex = (maxTurnRow?.max_turn ?? -1) + 1;
+
+    let currentTurn: { text: string; byteOffset: number; byteEnd: number; timestamp: string } | null = null;
+    let turnsAdded = 0;
+    let lineOffset = startOffset;
+
+    const insertTurn = this.db.prepare(
+      'INSERT INTO turn_offsets (file_path, session_id, turn_index, byte_offset, byte_length, timestamp) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    const insertFts = this.db.prepare(
+      'INSERT INTO sessions_fts (rowid, text) VALUES (?, ?)'
+    );
+
+    const flushTurn = () => {
+      if (!currentTurn || !currentTurn.text.trim()) return;
+      const byteLength = currentTurn.byteEnd - currentTurn.byteOffset;
+      const result = insertTurn.run(filePath, sessionId, turnIndex, currentTurn.byteOffset, byteLength, currentTurn.timestamp);
+      insertFts.run(result.lastInsertRowid, currentTurn.text);
+      turnIndex++;
+      turnsAdded++;
+    };
+
+    const transaction = this.db.transaction(() => {
+      for (const line of lines) {
+        const lineBytes = Buffer.byteLength(line + '\n', 'utf-8');
+        if (!line.trim()) { lineOffset += lineBytes; continue; }
+
+        let obj: { type: string; message?: { role?: string; content?: unknown; timestamp?: number | string }; timestamp?: string };
+        try { obj = JSON.parse(line); } catch { lineOffset += lineBytes; continue; }
+
+        // Only index message entries. Other types (compaction, model_change,
+        // thinking_level_change, custom, label, session_info) are skipped.
+        if (obj.type === 'message' && obj.message) {
+          const role = obj.message.role;
+          const content = obj.message.content;
+
+          if (role === 'user') {
+            flushTurn();
+            currentTurn = {
+              text: this.extractText(content),
+              byteOffset: lineOffset,
+              byteEnd: lineOffset + lineBytes,
+              timestamp: String(obj.timestamp || obj.message?.timestamp || '')
+            };
+          } else if (role === 'assistant' && currentTurn) {
+            const text = this.extractText(content);
+            if (text) currentTurn.text += '\n' + text;
+            currentTurn.byteEnd = lineOffset + lineBytes;
+          } else if (role === 'toolResult' && currentTurn) {
+            const text = this.extractText(content);
+            if (text) {
+              const truncated = text.length > TOOL_RESULT_INDEX_CAP ? text.slice(0, TOOL_RESULT_INDEX_CAP) : text;
+              currentTurn.text += '\n' + truncated;
+            }
+            currentTurn.byteEnd = lineOffset + lineBytes;
+          }
+        }
+        lineOffset += lineBytes;
+      }
+      flushTurn();
+      this.db.prepare(
+        'INSERT OR REPLACE INTO indexed_files (path, size, mtime_ms, last_offset) VALUES (?, ?, ?, ?)'
+      ).run(filePath, stat.size, Math.floor(stat.mtimeMs), stat.size);
+    });
+
+    transaction();
+    return turnsAdded;
+  }
+
+  // ─── Text Extraction ─────────────────────────────────────────────────────
+
   /**
-   * File descriptor cache for batch reads within a single search.
-   * Avoids repeated open/close of the same file.
+   * Expand camelCase so both compound and parts are searchable.
+   * "readFileSync" → "readFileSync read File Sync"
+   * Only applies to words ≥6 chars with a case transition.
    */
+  private expandCamelCase(text: string): string {
+    return text.replace(/\b([a-zA-Z]{6,})\b/g, (match) => {
+      if (!/[a-z][A-Z]/.test(match) && !/[A-Z]{2,}[a-z]/.test(match)) return match;
+      const parts = match
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+      if (parts === match) return match;
+      return `${match} ${parts}`;
+    });
+  }
+
+  /**
+   * Extract searchable text from a pi-ai message content field.
+   * Handles: string content, TextContent blocks, ToolCall blocks.
+   * Skips: ThinkingContent (internal), ImageContent (binary).
+   */
+  private extractText(content: unknown): string {
+    if (!content) return '';
+    if (typeof content === 'string') return this.expandCamelCase(content);
+
+    if (Array.isArray(content)) {
+      const texts: string[] = [];
+      for (const block of content) {
+        if (typeof block !== 'object' || block === null) continue;
+        const b = block as { type: string; text?: string; name?: string };
+        switch (b.type) {
+          case 'text':
+            if (typeof b.text === 'string') texts.push(b.text);
+            break;
+          case 'toolCall':
+            if (typeof b.name === 'string') texts.push(`[tool:${b.name}]`);
+            break;
+        }
+      }
+      return this.expandCamelCase(texts.join('\n'));
+    }
+    return '';
+  }
+
+  // ─── Search Helpers ──────────────────────────────────────────────────────
+
+  /** FD cache — reuse file descriptors within a single search call. */
   private fdCache = new Map<string, number>();
 
   private getFd(filePath: string): number {
@@ -549,97 +533,14 @@ export class SessionIndex {
     this.fdCache.clear();
   }
 
-  /**
-   * Read raw bytes from a file at a specific offset. O(1).
-   * Uses fd cache to avoid repeated open/close for same file.
-   */
-  readBytes(filePath: string, offset: number, length: number): string {
-    try {
-      const fd = this.getFd(filePath);
-      const buffer = Buffer.alloc(length);
-      readSync(fd, buffer, 0, length, offset);
-      return buffer.toString('utf-8');
-    } catch {
-      return '';
-    }
-  }
-
-  /**
-   * Parse raw JSONL lines of a turn back into readable text.
-   * Uses fast pre-filter and truncates large lines before JSON.parse.
-   */
-  parseTurnText(rawLines: string): string {
-    const lines = rawLines.split('\n');
-    const parts: string[] = [];
-
-    for (const line of lines) {
-      // Fast pre-filter: skip empty lines and non-message types
-      if (line.length < 20) continue;
-      if (!line.includes('"message"')) continue;
-
-      try {
-        // For large tool results, we only need the beginning for display.
-        // Parse a truncated version to avoid the full JSON.parse cost.
-        let obj;
-        if (line.length > 4000 && line.includes('toolResult')) {
-          // Truncate content arrays in tool results — we only display 300 chars anyway
-          // Find the content field and cap it
-          const truncated = line.slice(0, 4000);
-          // Try to parse; if it fails due to truncation, extract role manually
-          try {
-            obj = JSON.parse(truncated + ']}]}');
-          } catch {
-            try { obj = JSON.parse(truncated + '"}]}]}'); } catch {
-              // Fall back to regex extraction
-              const roleMatch = line.match(/"role":"(\w+)"/);
-              if (roleMatch?.[1] === 'toolResult') {
-                const textMatch = line.match(/"text":"([^"]{0,400})/);
-                const snippet = textMatch?.[1] ?? '';
-                parts.push(`[tool result]: ${snippet}...\n[Showing 300 of ${line.length} chars. Full output in source file above.]`);
-              }
-              continue;
-            }
-          }
-        } else {
-          obj = JSON.parse(line);
-        }
-
-        if (obj.type !== 'message') continue;
-
-        const role = obj.message?.role;
-        const content = obj.message?.content;
-        const text = this.extractText(content);
-
-        if (text && role !== 'toolResult') {
-          parts.push(`${role}: ${text}`);
-        } else if (text && role === 'toolResult') {
-          if (text.length > 300) {
-            parts.push(`[tool result]: ${text.slice(0, 300)}...\n[Showing 300 of ${text.length} chars. Full output in source file above.]`);
-          } else {
-            parts.push(`[tool result]: ${text}`);
-          }
-        }
-      } catch {
-        // Skip unparseable lines
-      }
-    }
-
-    return parts.join('\n\n');
-  }
-
-  /**
-   * Get ±N surrounding turns for context.
-   */
-  // Cached prepared statement for context lookups
+  /** Cached prepared statement for context lookups. */
   private _stmtSurrounding: ReturnType<typeof this.db.prepare> | null = null;
   private get stmtSurrounding() {
     if (!this._stmtSurrounding) {
       this._stmtSurrounding = this.db.prepare(`
         SELECT rowid, file_path, session_id, turn_index, byte_offset, byte_length, timestamp
         FROM turn_offsets
-        WHERE file_path = ?
-          AND turn_index BETWEEN ? AND ?
-          AND turn_index != ?
+        WHERE file_path = ? AND turn_index BETWEEN ? AND ? AND turn_index != ?
         ORDER BY turn_index
       `);
     }
@@ -647,12 +548,11 @@ export class SessionIndex {
   }
 
   /**
-   * Lightweight text extraction for context turns.
-   * Only reads first 1KB and extracts user message + brief assistant preview.
-   * Much faster than full parseTurnText for large turns.
+   * Lightweight context turn parser. Only reads first 1.5KB and extracts
+   * user message + brief assistant preview. Full parseTurnText would be
+   * expensive here (context turns avg 12KB, mostly tool output).
    */
   private parseContextTurnText(filePath: string, offset: number, length: number): string {
-    // Read at most 1500 bytes — enough for user message + assistant start
     const readLen = Math.min(length, 1500);
     const raw = this.readBytes(filePath, offset, readLen);
     const lines = raw.split('\n');
@@ -661,7 +561,6 @@ export class SessionIndex {
     for (const line of lines) {
       if (line.length < 20 || !line.includes('"message"')) continue;
       try {
-        // For context, only parse user and first assistant text
         if (line.includes('"user"')) {
           const obj = JSON.parse(line);
           if (obj.type === 'message' && obj.message?.role === 'user') {
@@ -669,34 +568,19 @@ export class SessionIndex {
             if (text) parts.push(`user: ${text.slice(0, 200)}${text.length > 200 ? '...' : ''}`);
           }
         } else if (line.includes('"assistant"') && parts.length > 0) {
-          // For assistant in context, just show beginning
           const textMatch = line.match(/"text":"([^"]{0,150})/);
           if (textMatch) parts.push(`assistant: ${textMatch[1]}...`);
-          break; // Don't parse more
+          break;
         }
       } catch { continue; }
     }
-
     return parts.join('\n\n') || '(context turn)';
   }
 
-  private getSurroundingTurns(
-    filePath: string,
-    turnIndex: number,
-    range: number
-  ): Turn[] {
-    const minTurn = Math.max(0, turnIndex - range);
-    const maxTurn = turnIndex + range;
-
-    const rows = this.stmtSurrounding.all(filePath, minTurn, maxTurn, turnIndex) as Array<{
-      rowid: number;
-      file_path: string;
-      session_id: string;
-      turn_index: number;
-      byte_offset: number;
-      byte_length: number;
-      timestamp: string;
-    }>;
+  private getSurroundingTurns(filePath: string, turnIndex: number, range: number): Turn[] {
+    const rows = this.stmtSurrounding.all(
+      filePath, Math.max(0, turnIndex - range), turnIndex + range, turnIndex
+    ) as Array<{ rowid: number; file_path: string; session_id: string; turn_index: number; byte_offset: number; byte_length: number; timestamp: string }>;
 
     return rows.map(row => ({
       sessionId: row.session_id,
@@ -709,125 +593,56 @@ export class SessionIndex {
     }));
   }
 
+  // ─── Maintenance ─────────────────────────────────────────────────────────
+
   /**
-   * Remove all index entries for a file (used when file is rewritten/deleted).
-   * With contentless_delete=1, we can properly remove FTS entries by rowid.
+   * Remove all index entries for a file.
+   * Uses contentless_delete=1 for proper FTS cleanup (no orphaned entries).
    */
   private removeFileEntries(filePath: string): void {
     const transaction = this.db.transaction(() => {
-      // Get rowids to delete from FTS
       const rows = this.db.prepare(
         'SELECT rowid FROM turn_offsets WHERE file_path = ?'
       ).all(filePath) as Array<{ rowid: number }>;
 
-      // Delete from FTS (contentless_delete=1 allows this)
-      const deleteFts = this.db.prepare(
-        'DELETE FROM sessions_fts WHERE rowid = ?'
-      );
-      for (const row of rows) {
-        deleteFts.run(row.rowid);
-      }
+      const deleteFts = this.db.prepare('DELETE FROM sessions_fts WHERE rowid = ?');
+      for (const row of rows) deleteFts.run(row.rowid);
 
       this.db.prepare('DELETE FROM turn_offsets WHERE file_path = ?').run(filePath);
       this.db.prepare('DELETE FROM indexed_files WHERE path = ?').run(filePath);
     });
-
     transaction();
   }
 
-  /**
-   * Clean up entries for deleted session files.
-   */
-  async cleanup(): Promise<number> {
-    const files = this.db.prepare('SELECT path FROM indexed_files').all() as Array<{ path: string }>;
-    let removed = 0;
-
-    for (const { path } of files) {
-      try {
-        await fs.access(path);
-      } catch {
-        this.removeFileEntries(path);
-        removed++;
-      }
-    }
-
-    return removed;
-  }
-
-  /**
-   * List all project directories in sessions dir.
-   */
   private async listProjectDirs(): Promise<string[]> {
     try {
       const entries = await fs.readdir(this.sessionsDir, { withFileTypes: true });
       return entries.filter(e => e.isDirectory()).map(e => e.name);
-    } catch {
-      return [];
-    }
+    } catch { return []; }
   }
 
-  /**
-   * Get index statistics.
-   */
-  stats(): IndexStats {
-    const files = this.db.prepare('SELECT COUNT(*) as count FROM indexed_files').get() as { count: number };
-    const turns = this.db.prepare('SELECT COUNT(*) as count FROM turn_offsets').get() as { count: number };
-
-    // Approximate index size
-    let indexSize = 0;
-    try {
-      const pageCount = this.db.pragma('page_count') as Array<{ page_count: number }>;
-      const pageSize = this.db.pragma('page_size') as Array<{ page_size: number }>;
-      indexSize = (pageCount[0]?.page_count ?? 0) * (pageSize[0]?.page_size ?? 4096);
-    } catch {}
-
-    return {
-      totalFiles: files.count,
-      totalTurns: turns.count,
-      indexSizeBytes: indexSize
-    };
-  }
+  // ─── Query Sanitization ──────────────────────────────────────────────────
 
   /**
-   * Optimize FTS5 index (merge segments, reclaim space).
-   * Call periodically, not on every reindex.
-   */
-  optimize(): void {
-    this.db.exec("INSERT INTO sessions_fts(sessions_fts) VALUES('optimize')");
-  }
-
-  /**
-   * Sanitize a query for FTS5.
-   * - Empty/whitespace-only → returns empty string
-   * - Strips bare FTS5 operators (AND, OR, NOT, NEAR) that aren't part of real terms
+   * Sanitize user query for FTS5 syntax.
+   * - Strips FTS5 operators (AND/OR/NOT/NEAR) when used as bare words
+   * - Quotes terms with special chars (hyphens, dots, slashes)
    * - Balances unclosed quotes
-   * - Quotes terms containing special characters (hyphens, dots, etc.)
    */
   private sanitizeFtsQuery(query: string): string {
     if (!query || !query.trim()) return '';
 
-    // FTS5 reserved operators — strip when they appear as standalone tokens
     const FTS5_OPERATORS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
-
     const terms = query.split(/\s+/).filter(Boolean);
+
     const sanitized = terms
       .map(term => {
-        // Strip standalone FTS5 operators
-        if (FTS5_OPERATORS.has(term.toUpperCase()) && term === term.toUpperCase()) {
-          return null;
-        }
-
-        // Strip bare parentheses/brackets
+        if (FTS5_OPERATORS.has(term.toUpperCase()) && term === term.toUpperCase()) return null;
         const cleaned = term.replace(/^[()]+|[()]+$/g, '');
         if (!cleaned) return null;
-
-        // If term contains FTS5 special chars, quote it
         if (/[\-:.@\/\\*()]/.test(cleaned)) {
-          // Escape internal quotes
-          const escaped = cleaned.replace(/"/g, '""');
-          return `"${escaped}"`;
+          return `"${cleaned.replace(/"/g, '""')}"`;
         }
-
         return cleaned;
       })
       .filter(Boolean)
@@ -835,16 +650,8 @@ export class SessionIndex {
 
     if (!sanitized) return '';
 
-    // Balance unclosed quotes
+    // Balance unclosed quotes (FTS5 throws on odd quote count)
     const quoteCount = (sanitized.match(/"/g) || []).length;
-    if (quoteCount % 2 !== 0) {
-      return sanitized + '"';
-    }
-
-    return sanitized;
-  }
-
-  close(): void {
-    this.db.close();
+    return quoteCount % 2 !== 0 ? sanitized + '"' : sanitized;
   }
 }
