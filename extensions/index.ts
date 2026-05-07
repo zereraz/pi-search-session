@@ -13,6 +13,20 @@ const HOME = process.env.HOME || homedir();
 const INDEX_DB = join(HOME, ".pi", "agent", "session-index.db");
 const SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 
+/** Resolve time_range shorthand to ISO timestamp */
+function resolveTimeRange(range: string): string {
+  const now = Date.now();
+  switch (range) {
+    case 'day': return new Date(now - 24 * 60 * 60 * 1000).toISOString();
+    case 'week': return new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+    case 'month': return new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+    case 'year': return new Date(now - 365 * 24 * 60 * 60 * 1000).toISOString();
+    default:
+      // Treat as ISO date string (e.g. "2026-05-01")
+      return new Date(range).toISOString();
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   let sessionIndex: SessionIndex | null = null;
 
@@ -39,6 +53,12 @@ export default function (pi: ExtensionAPI) {
       project: Type.Optional(
         Type.String({ description: "Filter by project name" })
       ),
+      session_id: Type.Optional(
+        Type.String({ description: "Filter to a specific session by ID" })
+      ),
+      time_range: Type.Optional(
+        Type.String({ description: "Filter by time: 'day', 'week', 'month', 'year', or ISO date like '2026-05-01'" })
+      ),
       context_turns: Type.Optional(
         Type.Number({
           description: "Surrounding turns for context (default: 1)",
@@ -53,15 +73,19 @@ export default function (pi: ExtensionAPI) {
           limit: params.limit ?? 5,
           contextTurns: params.context_turns ?? 1,
           project: params.project,
+          sessionId: params.session_id,
+          after: params.time_range ? resolveTimeRange(params.time_range) : undefined,
         });
 
         if (results.length === 0) {
+          const filters = [params.project && `project: ${params.project}`, params.session_id && `session: ${params.session_id}`, params.time_range && `time: ${params.time_range}`].filter(Boolean).join(' | ');
           return {
-            content: [{ type: "text" as const, text: `Query: ${params.query}${params.project ? ` (project: ${params.project})` : ""}\nNo results found.` }],
+            content: [{ type: "text" as const, text: `Query: ${params.query}${filters ? ` (${filters})` : ""}\nNo results found.` }],
           };
         }
 
-        let output = `Query: ${params.query}${params.project ? ` | project: ${params.project}` : ""} | ${results.length} results\n\n`;
+        const filters = [params.project && `project: ${params.project}`, params.session_id && `session: ${params.session_id.slice(0,8)}`, params.time_range && `time: ${params.time_range}`].filter(Boolean).join(' | ');
+        let output = `Query: ${params.query}${filters ? ` | ${filters}` : ""} | ${results.length} results\n\n`;
         output += results
           .map((r: any, i: number) => {
             let entry = `## Result ${i + 1} (score: ${r.score.toFixed(2)})\n`;

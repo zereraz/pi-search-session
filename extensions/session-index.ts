@@ -155,6 +155,8 @@ export class SessionIndex {
     contextTurns?: number;
     sessionId?: string;
     project?: string;
+    /** ISO timestamp — only return turns after this date */
+    after?: string;
   }): SearchResult[] {
     const limit = options?.limit ?? 10;
     const contextTurns = options?.contextTurns ?? 2;
@@ -178,6 +180,10 @@ export class SessionIndex {
     if (options?.project) {
       sql += ` AND t.file_path LIKE ?`;
       params.push(`%${options.project}%`);
+    }
+    if (options?.after) {
+      sql += ` AND t.timestamp > ?`;
+      params.push(options.after);
     }
     sql += ` ORDER BY rank LIMIT ?`;
     params.push(limit);
@@ -327,6 +333,7 @@ export class SessionIndex {
       );
       CREATE INDEX IF NOT EXISTS idx_turn_session ON turn_offsets(session_id);
       CREATE INDEX IF NOT EXISTS idx_turn_file ON turn_offsets(file_path);
+      CREATE INDEX IF NOT EXISTS idx_turn_timestamp ON turn_offsets(timestamp);
 
       -- contentless_delete=1 requires SQLite >=3.43
       CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
