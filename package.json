@@ -1,10 +1,19 @@
 {
   "name": "pi-session-search",
   "version": "0.1.0",
+  "type": "module",
   "description": "Full-text search across all pi sessions — contentless FTS5 index with O(1) retrieval",
-  "keywords": ["pi-package", "pi-extension", "search", "sessions", "fts5"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "search",
+    "sessions",
+    "fts5"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
@@ -19,5 +28,13 @@
     "url": "git+https://github.com/zereraz/pi-session-search.git"
   },
   "homepage": "https://github.com/zereraz/pi-session-search#readme",
-  "license": "MIT"
+  "scripts": {
+    "bench": "node --import tsx bench/quality.ts",
+    "bench:rg": "node --import tsx bench/quality-vs-rg.ts",
+    "bench:perf": "node --import tsx bench/vs-ripgrep.ts"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
 }
