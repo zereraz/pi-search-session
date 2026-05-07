@@ -533,9 +533,12 @@ export class SessionIndex {
         if (text && role !== 'toolResult') {
           parts.push(`${role}: ${text}`);
         } else if (text && role === 'toolResult') {
-          // Brief tool result
-          const brief = text.length > 300 ? text.slice(0, 300) + '...' : text;
-          parts.push(`[tool result]: ${brief}`);
+          // Brief tool result — full content available in source file
+          if (text.length > 300) {
+            parts.push(`[tool result]: ${text.slice(0, 300)}... (truncated, ${text.length} chars total)`);
+          } else {
+            parts.push(`[tool result]: ${text}`);
+          }
         }
       } catch {
         // Skip unparseable lines

@@ -64,7 +64,8 @@ export default function (pi: ExtensionAPI) {
         const output = results
           .map((r: any, i: number) => {
             let entry = `## Result ${i + 1} (score: ${r.score.toFixed(2)})\n`;
-            entry += `Session: ${r.sessionId} | Turn: ${r.turnIndex}\n\n`;
+            entry += `Session: ${r.sessionId} | Turn: ${r.turnIndex}\n`;
+            entry += `File: ${r.sessionFile}\n\n`;
             entry += r.text;
             if (r.context?.length) {
               entry += `\n\n<context>\n${r.context.map((c: any) => c.text).join("\n---\n")}\n</context>`;
