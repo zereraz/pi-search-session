@@ -1,0 +1,22 @@
+{
+  "name": "pi-session-search",
+  "version": "0.1.0",
+  "description": "Full-text search across all pi sessions — contentless FTS5 index with O(1) retrieval",
+  "keywords": ["pi-package", "pi-extension", "search", "sessions", "fts5"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zereraz/pi-session-search.git"
+  },
+  "homepage": "https://github.com/zereraz/pi-session-search#readme",
+  "license": "MIT"
+}
