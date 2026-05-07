@@ -65,7 +65,7 @@ const DEFAULT_SESSIONS_DIR = join(
 );
 
 export class SessionIndex {
-  private db: Database.Database;
+  db: Database.Database;
   private sessionsDir: string;
 
   constructor(
@@ -504,7 +504,7 @@ export class SessionIndex {
   /**
    * Read raw bytes from a file at a specific offset. O(1).
    */
-  private readBytes(filePath: string, offset: number, length: number): string {
+  readBytes(filePath: string, offset: number, length: number): string {
     try {
       const fd = openSync(filePath, 'r');
       const buffer = Buffer.alloc(length);
@@ -519,7 +519,7 @@ export class SessionIndex {
   /**
    * Parse raw JSONL lines of a turn back into readable text.
    */
-  private parseTurnText(rawLines: string): string {
+  parseTurnText(rawLines: string): string {
     const lines = rawLines.split('\n').filter(l => l.trim());
     const parts: string[] = [];
 
