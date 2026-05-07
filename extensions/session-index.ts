@@ -646,6 +646,40 @@ export class SessionIndex {
     return this._stmtSurrounding;
   }
 
+  /**
+   * Lightweight text extraction for context turns.
+   * Only reads first 1KB and extracts user message + brief assistant preview.
+   * Much faster than full parseTurnText for large turns.
+   */
+  private parseContextTurnText(filePath: string, offset: number, length: number): string {
+    // Read at most 1500 bytes — enough for user message + assistant start
+    const readLen = Math.min(length, 1500);
+    const raw = this.readBytes(filePath, offset, readLen);
+    const lines = raw.split('\n');
+    const parts: string[] = [];
+
+    for (const line of lines) {
+      if (line.length < 20 || !line.includes('"message"')) continue;
+      try {
+        // For context, only parse user and first assistant text
+        if (line.includes('"user"')) {
+          const obj = JSON.parse(line);
+          if (obj.type === 'message' && obj.message?.role === 'user') {
+            const text = this.extractText(obj.message.content);
+            if (text) parts.push(`user: ${text.slice(0, 200)}${text.length > 200 ? '...' : ''}`);
+          }
+        } else if (line.includes('"assistant"') && parts.length > 0) {
+          // For assistant in context, just show beginning
+          const textMatch = line.match(/"text":"([^"]{0,150})/);
+          if (textMatch) parts.push(`assistant: ${textMatch[1]}...`);
+          break; // Don't parse more
+        }
+      } catch { continue; }
+    }
+
+    return parts.join('\n\n') || '(context turn)';
+  }
+
   private getSurroundingTurns(
     filePath: string,
     turnIndex: number,
@@ -671,7 +705,7 @@ export class SessionIndex {
       timestamp: row.timestamp,
       byteOffset: row.byte_offset,
       byteLength: row.byte_length,
-      text: this.parseTurnText(this.readBytes(row.file_path, row.byte_offset, row.byte_length))
+      text: this.parseContextTurnText(row.file_path, row.byte_offset, row.byte_length)
     }));
   }
 
