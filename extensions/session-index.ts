@@ -12,11 +12,20 @@
  *   turn_offsets(file_path, session_id, turn_index, byte_offset, byte_length, timestamp)
  *   sessions_fts(text) — contentless-delete FTS5 with porter+unicode61
  *
- * JSONL format (pi-mono sessions):
- *   Line 0: { type: "session", version: 3, id: UUID, timestamp, cwd }
- *   Lines:  { type: "message", id, parentId, timestamp, message: { role, content } }
- *   Roles:  "user" | "assistant" | "toolResult"
- *   Other types (compaction, model_change, custom, etc.) are skipped.
+ * JSONL format (pi-mono sessions, types from @mariozechner/pi-coding-agent):
+ *   Line 0: SessionHeader { type: "session", version: 3, id, timestamp, cwd }
+ *   Lines:  SessionEntry { type, id, parentId, timestamp, ... }
+ *
+ * Indexed entry types:
+ *   - SessionMessageEntry (roles: "user" | "assistant" | "toolResult")
+ *   - CompactionEntry (summary text — high-level session context)
+ *   - BranchSummaryEntry (summary of branched conversation paths)
+ *   - CustomMessageEntry (extension-injected searchable content)
+ *
+ * Skipped entry types:
+ *   - ModelChangeEntry, ThinkingLevelChangeEntry (config, not text)
+ *   - CustomEntry (opaque state, e.g. pi-goal state blobs)
+ *   - LabelEntry, SessionInfoEntry (metadata, not searchable)
  *
  * Performance (356 files, 150MB, 2556 turns):
  *   Cold build: ~1200ms (126 MB/s)  |  Warm reindex: 9ms
@@ -28,6 +37,15 @@ import { promises as fs } from 'fs';
 import { join, resolve } from 'path';
 import { openSync, readSync, closeSync } from 'fs';
 import { homedir } from 'os';
+import type {
+  SessionHeader,
+  SessionEntry,
+  SessionMessageEntry,
+  CompactionEntry,
+  BranchSummaryEntry,
+  CustomMessageEntry,
+  FileEntry,
+} from '@mariozechner/pi-coding-agent';
 
 // ─── Public Types ────────────────────────────────────────────────────────────
 
@@ -424,14 +442,14 @@ export class SessionIndex {
         const lineBytes = Buffer.byteLength(line + '\n', 'utf-8');
         if (!line.trim()) { lineOffset += lineBytes; continue; }
 
-        let obj: { type: string; message?: { role?: string; content?: unknown; timestamp?: number | string }; timestamp?: string };
+        let obj: FileEntry;
         try { obj = JSON.parse(line); } catch { lineOffset += lineBytes; continue; }
 
-        // Only index message entries. Other types (compaction, model_change,
-        // thinking_level_change, custom, label, session_info) are skipped.
-        if (obj.type === 'message' && obj.message) {
-          const role = obj.message.role;
-          const content = obj.message.content;
+        // Index message entries (user/assistant/toolResult turns)
+        if (obj.type === 'message' && (obj as SessionMessageEntry).message) {
+          const msg = (obj as SessionMessageEntry).message;
+          const role = msg.role;
+          const content = msg.content;
 
           if (role === 'user') {
             flushTurn();
@@ -439,7 +457,7 @@ export class SessionIndex {
               text: this.extractText(content),
               byteOffset: lineOffset,
               byteEnd: lineOffset + lineBytes,
-              timestamp: String(obj.timestamp || obj.message?.timestamp || '')
+              timestamp: String(obj.timestamp || '')
             };
           } else if (role === 'assistant' && currentTurn) {
             const text = this.extractText(content);
@@ -454,6 +472,32 @@ export class SessionIndex {
             currentTurn.byteEnd = lineOffset + lineBytes;
           }
         }
+        // Index compaction summaries — high-level session context written by pi
+        else if (obj.type === 'compaction' && (obj as CompactionEntry).summary) {
+          const summary = (obj as CompactionEntry).summary;
+          if (currentTurn) {
+            currentTurn.text += '\n[compaction]: ' + summary;
+            currentTurn.byteEnd = lineOffset + lineBytes;
+          }
+        }
+        // Index branch summaries — summaries of branched-off conversation paths
+        else if (obj.type === 'branch_summary' && (obj as BranchSummaryEntry).summary) {
+          const summary = (obj as BranchSummaryEntry).summary;
+          if (currentTurn) {
+            currentTurn.text += '\n[branch_summary]: ' + summary;
+            currentTurn.byteEnd = lineOffset + lineBytes;
+          }
+        }
+        // Index custom_message content — extensions can inject searchable context
+        else if (obj.type === 'custom_message' && (obj as CustomMessageEntry).content) {
+          const cm = obj as CustomMessageEntry;
+          const text = this.extractText(cm.content);
+          if (text && currentTurn) {
+            currentTurn.text += '\n' + text;
+            currentTurn.byteEnd = lineOffset + lineBytes;
+          }
+        }
+        // Skipped: model_change, thinking_level_change, custom (state-only), label, session_info
         lineOffset += lineBytes;
       }
       flushTurn();
