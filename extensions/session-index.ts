@@ -535,9 +535,8 @@ export class SessionIndex {
         if (text && role !== 'toolResult') {
           parts.push(`${role}: ${text}`);
         } else if (text && role === 'toolResult') {
-          // Brief tool result — full content available in source file
           if (text.length > 300) {
-            parts.push(`[tool result]: ${text.slice(0, 300)}... (truncated, ${text.length} chars total)`);
+            parts.push(`[tool result]: ${text.slice(0, 300)}...\n[Showing 300 of ${text.length} chars. Full output in source file above.]`);
           } else {
             parts.push(`[tool result]: ${text}`);
           }
