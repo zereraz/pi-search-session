@@ -57,11 +57,12 @@ export default function (pi: ExtensionAPI) {
 
         if (results.length === 0) {
           return {
-            content: [{ type: "text" as const, text: "No results found." }],
+            content: [{ type: "text" as const, text: `Query: ${params.query}${params.project ? ` (project: ${params.project})` : ""}\nNo results found.` }],
           };
         }
 
-        const output = results
+        let output = `Query: ${params.query}${params.project ? ` | project: ${params.project}` : ""} | ${results.length} results\n\n`;
+        output += results
           .map((r: any, i: number) => {
             let entry = `## Result ${i + 1} (score: ${r.score.toFixed(2)})\n`;
             entry += `Session: ${r.sessionId} | Turn: ${r.turnIndex}\n`;
