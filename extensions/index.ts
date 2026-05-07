@@ -7,8 +7,9 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { SessionIndex } from "./session-index.js";
 import { join } from "path";
+import { homedir } from "os";
 
-const HOME = process.env.HOME || "~";
+const HOME = process.env.HOME || homedir();
 const INDEX_DB = join(HOME, ".pi", "agent", "session-index.db");
 const SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 

@@ -24,6 +24,7 @@ import Database from 'better-sqlite3';
 import { promises as fs } from 'fs';
 import { join, resolve } from 'path';
 import { openSync, readSync, closeSync } from 'fs';
+import { homedir } from 'os';
 
 /** A turn: user question + assistant response (may include tool calls/results) */
 export interface Turn {
@@ -57,7 +58,7 @@ export interface IndexStats {
 }
 
 const DEFAULT_SESSIONS_DIR = join(
-  process.env.HOME || '~',
+  process.env.HOME || homedir(),
   '.pi',
   'agent',
   'sessions'
@@ -190,12 +191,18 @@ export class SessionIndex {
     stat: { size: number; mtimeMs: number }
   ): Promise<number> {
     // Read the file content from startOffset
-    const fd = openSync(filePath, 'r');
-    const buffer = Buffer.alloc(stat.size - startOffset);
-    readSync(fd, buffer, 0, buffer.length, startOffset);
-    closeSync(fd);
-
-    const content = buffer.toString('utf-8');
+    let fd: number | null = null;
+    let content: string;
+    try {
+      fd = openSync(filePath, 'r');
+      const buffer = Buffer.alloc(stat.size - startOffset);
+      readSync(fd, buffer, 0, buffer.length, startOffset);
+      content = buffer.toString('utf-8');
+    } catch {
+      return 0;
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
     // Split into lines, removing trailing empty element from final newline
     const lines = content.split('\n');
     if (lines.length > 0 && lines[lines.length - 1] === '') {
@@ -223,15 +230,18 @@ export class SessionIndex {
 
     if (!sessionId) {
       // Can't index without session ID — try reading first line of file
-      const headerFd = openSync(filePath, 'r');
-      const headerBuf = Buffer.alloc(Math.min(1024, stat.size));
-      readSync(headerFd, headerBuf, 0, headerBuf.length, 0);
-      closeSync(headerFd);
-      const firstLine = headerBuf.toString('utf-8').split('\n')[0];
+      let headerFd: number | null = null;
       try {
+        headerFd = openSync(filePath, 'r');
+        const headerBuf = Buffer.alloc(Math.min(1024, stat.size));
+        readSync(headerFd, headerBuf, 0, headerBuf.length, 0);
+        const firstLine = headerBuf.toString('utf-8').split('\n')[0];
         const header = JSON.parse(firstLine);
         if (header.type === 'session') sessionId = header.id;
       } catch {}
+      finally {
+        if (headerFd !== null) closeSync(headerFd);
+      }
     }
 
     if (!sessionId) return 0;

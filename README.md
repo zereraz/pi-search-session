@@ -51,21 +51,6 @@ Benchmarked against 277 sessions, 25MB corpus:
 | Search avg | 3.8ms/query |
 | Precision | 76% (all query terms in same turn) |
 
-## Library usage
-
-```typescript
-import { SessionIndex } from "pi-session-search";
-
-const index = new SessionIndex("./index.db", "~/.pi/agent/sessions");
-await index.reindex();
-
-const results = index.search("database migration error", {
-  limit: 10,
-  contextTurns: 2,
-  project: "my-app",
-});
-```
-
 ## Requirements
 
 - `better-sqlite3` (native module, needs build tools)
