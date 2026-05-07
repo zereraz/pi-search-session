@@ -105,10 +105,12 @@ export class SessionIndex {
       CREATE INDEX IF NOT EXISTS idx_turn_file
         ON turn_offsets(file_path);
 
-      -- Contentless FTS5 — stores only the inverted index, not the text
+      -- Contentless-delete FTS5 — stores only the inverted index, not the text
+      -- contentless_delete=1 enables proper DELETE support (SQLite >=3.43)
       CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
         text,
         content='',
+        contentless_delete=1,
         content_rowid='rowid',
         tokenize='porter unicode61'
       );
@@ -589,13 +591,25 @@ export class SessionIndex {
 
   /**
    * Remove all index entries for a file (used when file is rewritten/deleted).
+   * With contentless_delete=1, we can properly remove FTS entries by rowid.
    */
   private removeFileEntries(filePath: string): void {
     const transaction = this.db.transaction(() => {
+      // Get rowids to delete from FTS
+      const rows = this.db.prepare(
+        'SELECT rowid FROM turn_offsets WHERE file_path = ?'
+      ).all(filePath) as Array<{ rowid: number }>;
+
+      // Delete from FTS (contentless_delete=1 allows this)
+      const deleteFts = this.db.prepare(
+        'DELETE FROM sessions_fts WHERE rowid = ?'
+      );
+      for (const row of rows) {
+        deleteFts.run(row.rowid);
+      }
+
       this.db.prepare('DELETE FROM turn_offsets WHERE file_path = ?').run(filePath);
       this.db.prepare('DELETE FROM indexed_files WHERE path = ?').run(filePath);
-      // Note: contentless FTS5 entries become orphaned but are cleaned on optimize().
-      // Proper deletion requires the original text, which we don't store.
     });
 
     transaction();
