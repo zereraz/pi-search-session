@@ -29,6 +29,7 @@
   },
   "homepage": "https://github.com/zereraz/pi-session-search#readme",
   "scripts": {
+    "test": "npx tsx --test 'extensions/__tests__/**/*.test.ts'",
     "bench": "node --import tsx bench/quality.ts",
     "bench:rg": "node --import tsx bench/quality-vs-rg.ts",
     "bench:perf": "node --import tsx bench/vs-ripgrep.ts"

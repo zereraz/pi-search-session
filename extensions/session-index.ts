@@ -264,6 +264,16 @@ export class SessionIndex {
 
     for (const line of lines) {
       if (line.length < 20) continue;
+
+      // Handle compaction/branch_summary entries (not messages but have searchable text)
+      if (line.includes('"compaction"') || line.includes('"branch_summary"')) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.summary) parts.push(`[${obj.type}]: ${obj.summary}`);
+        } catch {}
+        continue;
+      }
+
       if (!line.includes('"message"')) continue;
 
       try {
@@ -483,7 +493,7 @@ export class SessionIndex {
         else if (obj.type === 'compaction' && (obj as CompactionEntry).summary) {
           const summary = (obj as CompactionEntry).summary;
           if (currentTurn) {
-            currentTurn.text += '\n[compaction]: ' + summary;
+            currentTurn.text += '\n[compaction]: ' + this.expandCamelCase(summary);
             currentTurn.byteEnd = lineOffset + lineBytes;
           }
         }
@@ -491,7 +501,7 @@ export class SessionIndex {
         else if (obj.type === 'branch_summary' && (obj as BranchSummaryEntry).summary) {
           const summary = (obj as BranchSummaryEntry).summary;
           if (currentTurn) {
-            currentTurn.text += '\n[branch_summary]: ' + summary;
+            currentTurn.text += '\n[branch_summary]: ' + this.expandCamelCase(summary);
             currentTurn.byteEnd = lineOffset + lineBytes;
           }
         }
