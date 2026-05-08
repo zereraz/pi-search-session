@@ -1,6 +1,21 @@
 # pi-session-search
 
-Full-text search across all pi sessions. Contentless FTS5 index with BM25 ranking.
+Search across all past pi sessions — find conversations, code, errors, decisions.
+
+The agent gets instant recall of everything you've discussed across all sessions,
+without loading full transcripts into context.
+
+## Why
+
+Without this, the agent has no memory between sessions. With this:
+- "Find that vllm discussion from last week" → 4ms, ranked by relevance
+- "Which session had the ERR_MODULE error?" → regex scan, 12ms
+- "What did we decide about the memory store?" → finds the exact turn
+
+vs `rg` over session files:
+- No ranking (rg just finds files, not relevant turns)
+- No turn boundaries (matches scattered across unrelated exchanges)
+- No filtering (project, time, session)
 
 ## Install
 
@@ -14,10 +29,8 @@ pi install github:zereraz/pi-search-session
 
 ```
 query="vllm caching" ──► FTS5 MATCH ──► BM25 rank ──► pread(file, offset) ──► result
-                              │
 pattern="ERR_\w+" ──────► scan 2KB/turn ──► regex.exec ──► snippet ──► result
-                              │
-query + pattern ──────► FTS5 first ──► regex post-filter ──► result
+query + pattern ────────► FTS5 first ──► regex post-filter ──► result
 ```
 
 | Param | Description |
@@ -44,7 +57,7 @@ stat each .jsonl ──► compare watermark ──► read delta bytes ──�
 ```
 ~/.pi/agent/sessions/**/*.jsonl        (source of truth, 150MB)
          │
-         ▼  reindex (watermark per file, only new bytes)
+         ▼  reindex (per-file watermark, only new bytes)
          │
 ~/.pi/agent/session-index.db           (FTS5 inverted index, 6MB)
          │
@@ -56,15 +69,24 @@ stat each .jsonl ──► compare watermark ──► read delta bytes ──�
 
 ## Performance
 
-| Operation | Time |
-|-----------|------|
-| Cold index (356 files, 150MB) | ~1200ms |
-| Warm reindex | 9ms |
-| FTS5 search (with context) | ~4ms |
-| Regex search | 2-15ms |
+| Operation | Time | Notes |
+|-----------|------|-------|
+| Cold index (356 files, 150MB) | ~1200ms | One-time, 126 MB/s |
+| Warm reindex | 9ms | Just stats 356 files |
+| FTS5 search (with context) | ~4ms | Inverted index + pread |
+| Regex search | 2-15ms | 5MB scan, beats rg |
 
-Regex beats ripgrep (0.2-0.9x) because we scan 5MB (2KB/turn) vs rg's 150MB.
-Trade-off: matches deep in tool output (>2KB) are missed.
+### vs grep/ripgrep
+
+**FTS5 mode** (quality, 50 random test cases):
+- Recall@10: ~75% vs rg's ~51% — finds the right turn more often
+- MRR: 0.58 vs 0.26 — ranks correct result higher
+- 3x more likely to be the #1 result
+
+**Regex mode** (speed, 8 patterns):
+- 0.2x–0.9x of ripgrep's time (faster on all tested patterns)
+- We scan 5MB (2KB/turn), rg scans 150MB (full files)
+- We return turns with metadata, rg returns file paths
 
 ## Requirements
 
