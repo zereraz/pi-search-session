@@ -1,6 +1,6 @@
 # pi-session-search
 
-Full-text search across all pi sessions. Contentless FTS5 index with BM25 ranking and O(1) byte-offset retrieval.
+Full-text search across all pi sessions. Contentless FTS5 index with BM25 ranking.
 
 ## Install
 
@@ -10,69 +10,77 @@ pi install github:zereraz/pi-search-session
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `search_sessions` | BM25-ranked search across all past sessions |
-| `reindex_sessions` | Rebuild index incrementally (only new content) |
+### `search_sessions`
 
-### `search_sessions` parameters
+```
+query="vllm caching" ──► FTS5 MATCH ──► BM25 rank ──► pread(file, offset) ──► result
+                              │
+pattern="ERR_\w+" ──────► scan 2KB/turn ──► regex.exec ──► snippet ──► result
+                              │
+query + pattern ──────► FTS5 first ──► regex post-filter ──► result
+```
 
 | Param | Description |
 |-------|-------------|
-| `query` | Natural language or keywords |
+| `query` | Keywords (FTS5). Optional if `pattern` provided |
+| `pattern` | Regex. Standalone or post-filter on `query` |
 | `limit` | Max results (default: 5) |
-| `project` | Filter by project directory name |
-| `context_turns` | Surrounding turns for context (default: 1) |
+| `project` | Filter by project name |
+| `session_id` | Filter to specific session |
+| `time_range` | `'day'`, `'week'`, `'month'`, `'year'`, or ISO date |
+| `context_turns` | Surrounding turns (default: 1) |
 
-Each result includes the source file path, so the agent can `read` the original JSONL file directly for full untruncated content (tool results are previewed at 300 chars in search output).
+Results include source file path — agent can `read` for full content.
 
-## Design
+### `reindex_sessions`
 
-**No data duplication.** The FTS5 index is contentless — it stores only the inverted index (term positions), not the text. Retrieval reads directly from pi's original JSONL session files via byte offsets.
-
-**Turn granularity.** Each indexed document is one conversational turn: user message + assistant response + tool results. This means query terms must co-occur in the same exchange, eliminating false positives from scattered term matches.
-
-**Incremental.** Per-file watermarks (`path, size, mtime, last_offset`) track what's already indexed. Only new bytes are processed on reindex.
-
-**Proper cleanup.** Uses `contentless_delete=1` (SQLite ≥3.43) so deleted/rewritten session files are properly removed from the FTS index.
-
-## Performance
-
-Measured against 355 sessions (~30MB corpus):
-
-| Metric | Value |
-|--------|-------|
-| Cold build | ~900ms |
-| Warm reindex | 9ms |
-| Search | 1-4ms |
-| DB size | ~6MB (20% of corpus) |
-| Turns indexed | 2529 |
+```
+stat each .jsonl ──► compare watermark ──► read delta bytes ──► parse turns ──► FTS5 insert
+     356 files          skip unchanged         only new bytes       ~9ms warm
+```
 
 ## How it works
 
 ```
-~/.pi/agent/sessions/          ← pi's JSONL session files (source of truth)
-~/.pi/agent/session-index.db   ← FTS5 index (this package)
-
-Indexing:
-  1. Walk sessions dir, stat each .jsonl file
-  2. Skip unchanged files (watermark match)
-  3. Read new bytes from changed files
-  4. Parse turns (user msg → assistant/tool responses)
-  5. Insert into FTS5 + store byte offsets in turn_offsets table
-
-Search:
-  1. FTS5 MATCH query → BM25-ranked rowids
-  2. Join with turn_offsets → get file path + byte offset
-  3. pread() original JSONL at offset → parse turn text
-  4. Fetch ±N surrounding turns for context
+~/.pi/agent/sessions/**/*.jsonl        (source of truth, 150MB)
+         │
+         ▼  reindex (watermark per file, only new bytes)
+         │
+~/.pi/agent/session-index.db           (FTS5 inverted index, 6MB)
+         │
+         ▼  search
+         │
+    FTS5: inverted index O(1) → pread at byte offset → parse
+    Regex: scan 2KB × 2578 turns (5MB) → snippet around match
 ```
+
+## Performance
+
+| Operation | Time |
+|-----------|------|
+| Cold index (356 files, 150MB) | ~1200ms |
+| Warm reindex | 9ms |
+| FTS5 search (with context) | ~4ms |
+| Regex search | 2-15ms |
+
+Regex beats ripgrep (0.2-0.9x) because we scan 5MB (2KB/turn) vs rg's 150MB.
+Trade-off: matches deep in tool output (>2KB) are missed.
 
 ## Requirements
 
-- `better-sqlite3` (native module — needs build tools: gcc/clang, make, python3)
-- SQLite ≥3.43 (for `contentless_delete=1`)
+- `better-sqlite3` (native, needs build tools)
+- SQLite ≥3.43
 - pi sessions at `~/.pi/agent/sessions/`
+
+## Development
+
+```bash
+npm test              # 31 tests
+npm run bench         # precision/recall
+npm run bench:rg      # FTS5 vs rg quality
+npm run bench:regex   # regex vs rg speed
+npm run bench:perf    # FTS5 speed
+```
 
 ## License
 
