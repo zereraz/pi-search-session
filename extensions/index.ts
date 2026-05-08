@@ -44,9 +44,9 @@ export default function (pi: ExtensionAPI) {
     description:
       "Search across all past pi sessions using full-text search. Returns BM25-ranked results with context.",
     parameters: Type.Object({
-      query: Type.String({
-        description: "Search query (natural language or keywords)",
-      }),
+      query: Type.Optional(Type.String({
+        description: "Search query (natural language or keywords). Required unless pattern is provided.",
+      })),
       limit: Type.Optional(
         Type.Number({ description: "Max results (default: 5)" })
       ),
@@ -59,6 +59,9 @@ export default function (pi: ExtensionAPI) {
       time_range: Type.Optional(
         Type.String({ description: "Filter by time: 'day', 'week', 'month', 'year', or ISO date like '2026-05-01'" })
       ),
+      pattern: Type.Optional(
+        Type.String({ description: "Regex pattern to filter results (applied after FTS5 search)" })
+      ),
       context_turns: Type.Optional(
         Type.Number({
           description: "Surrounding turns for context (default: 1)",
@@ -69,23 +72,39 @@ export default function (pi: ExtensionAPI) {
       try {
         const idx = await getSessionIndex();
         await idx.reindex();
-        const results = idx.search(params.query, {
+
+        const searchOpts = {
           limit: params.limit ?? 5,
-          contextTurns: params.context_turns ?? 1,
           project: params.project,
           sessionId: params.session_id,
           after: params.time_range ? resolveTimeRange(params.time_range) : undefined,
-        });
+        };
+
+        let results;
+        if (params.pattern && !params.query) {
+          // Pure regex search (no FTS5)
+          results = idx.searchRegex(params.pattern, searchOpts);
+        } else {
+          // FTS5 search, optionally post-filtered by regex
+          results = idx.search(params.query, { ...searchOpts, contextTurns: params.context_turns ?? 1 });
+          if (params.pattern && results.length > 0) {
+            try {
+              const re = new RegExp(params.pattern, 'i');
+              results = results.filter((r: any) => re.test(r.text));
+            } catch {}
+          }
+        }
 
         if (results.length === 0) {
-          const filters = [params.project && `project: ${params.project}`, params.session_id && `session: ${params.session_id}`, params.time_range && `time: ${params.time_range}`].filter(Boolean).join(' | ');
+          const filters = [params.project && `project: ${params.project}`, params.session_id && `session: ${params.session_id}`, params.time_range && `time: ${params.time_range}`, params.pattern && `pattern: /${params.pattern}/`].filter(Boolean).join(' | ');
+          const queryStr = params.query || params.pattern || '';
           return {
-            content: [{ type: "text" as const, text: `Query: ${params.query}${filters ? ` (${filters})` : ""}\nNo results found.` }],
+            content: [{ type: "text" as const, text: `Query: ${queryStr}${filters ? ` (${filters})` : ""}\nNo results found.` }],
           };
         }
 
-        const filters = [params.project && `project: ${params.project}`, params.session_id && `session: ${params.session_id.slice(0,8)}`, params.time_range && `time: ${params.time_range}`].filter(Boolean).join(' | ');
-        let output = `Query: ${params.query}${filters ? ` | ${filters}` : ""} | ${results.length} results\n\n`;
+        const filters = [params.project && `project: ${params.project}`, params.session_id && `session: ${params.session_id?.slice(0,8)}`, params.time_range && `time: ${params.time_range}`, params.pattern && `pattern: /${params.pattern}/`].filter(Boolean).join(' | ');
+        let output = `Query: ${params.query || params.pattern}${filters ? ` | ${filters}` : ""} | ${results.length} results\n\n`;
         output += results
           .map((r: any, i: number) => {
             let entry = `## Result ${i + 1} (score: ${r.score.toFixed(2)})\n`;
