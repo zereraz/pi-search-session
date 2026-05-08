@@ -216,8 +216,8 @@ export class SessionIndex {
 
   /**
    * Regex search across all turns. Scans first 2KB of each turn.
-   * Slower than FTS5 search but supports arbitrary patterns.
-   * ~16ms for 2500 turns — competitive with ripgrep but gives turn-level results.
+   * For matched turns, shows a snippet around the match rather than full-parsing.
+   * ~6-25ms for 2500 turns depending on pattern selectivity.
    */
   searchRegex(pattern: string, options?: {
     limit?: number;
@@ -227,7 +227,7 @@ export class SessionIndex {
   }): SearchResult[] {
     const limit = options?.limit ?? 10;
     let regex: RegExp;
-    try { regex = new RegExp(pattern, 'i'); } catch { return []; }
+    try { regex = new RegExp(pattern, 'ig'); } catch { return []; }
 
     let sql = 'SELECT file_path, session_id, turn_index, byte_offset, byte_length, timestamp FROM turn_offsets WHERE 1=1';
     const params: (string | number)[] = [];
@@ -245,16 +245,27 @@ export class SessionIndex {
     for (const row of rows) {
       if (results.length >= limit) break;
       // Read first 2KB — user messages + assistant start are almost always here
-      const raw = this.readBytes(row.file_path, row.byte_offset, Math.min(row.byte_length, 2000));
-      if (!regex.test(raw)) continue;
+      const scanLen = Math.min(row.byte_length, 2000);
+      const raw = this.readBytes(row.file_path, row.byte_offset, scanLen);
+      regex.lastIndex = 0;
+      const match = regex.exec(raw);
+      if (!match) continue;
+
+      // Extract snippet around match (avoid full parseTurnText for speed)
+      const matchStart = Math.max(0, match.index - 80);
+      const matchEnd = Math.min(raw.length, match.index + match[0].length + 80);
+      const snippet = raw.slice(matchStart, matchEnd)
+        .replace(/[\n\r]+/g, ' ')
+        .replace(/\\["n]/g, ' ')
+        .trim();
 
       results.push({
         sessionId: row.session_id,
         sessionFile: row.file_path,
         turnIndex: row.turn_index,
         timestamp: row.timestamp,
-        score: 0, // no BM25 for regex
-        text: this.parseTurnText(this.readBytes(row.file_path, row.byte_offset, row.byte_length)),
+        score: 0,
+        text: `...${snippet}...`,
       });
     }
 

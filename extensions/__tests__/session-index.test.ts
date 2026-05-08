@@ -260,3 +260,77 @@ describe("cleanup", () => {
     assert.equal(results.length, 0, "should not find after cleanup");
   });
 });
+
+// ── Regex Search ─────────────────────────────────────────────────────────
+
+describe("searchRegex", () => {
+  test("finds by regex pattern", () => {
+    const results = idx.searchRegex("Session.*Index", { limit: 5 });
+    assert.ok(results.length > 0);
+    assert.ok(results[0].text.includes("Session"));
+  });
+
+  test("returns snippet around match", () => {
+    const results = idx.searchRegex("camelCase", { limit: 1 });
+    assert.ok(results.length > 0);
+    assert.ok(results[0].text.startsWith("..."));
+    assert.ok(results[0].text.endsWith("..."));
+  });
+
+  test("case insensitive by default", () => {
+    const upper = idx.searchRegex("SESSIONINDEX", { limit: 5 });
+    const lower = idx.searchRegex("sessionindex", { limit: 5 });
+    assert.equal(upper.length, lower.length);
+  });
+
+  test("respects limit", () => {
+    const r1 = idx.searchRegex(".", { limit: 3 });
+    assert.equal(r1.length, 3);
+    const r2 = idx.searchRegex(".", { limit: 1 });
+    assert.equal(r2.length, 1);
+  });
+
+  test("project filter works", () => {
+    const results = idx.searchRegex("migration", { limit: 10, project: "test-project" });
+    for (const r of results) {
+      assert.ok(r.sessionFile.includes("test-project"));
+    }
+  });
+
+  test("time filter works", () => {
+    const results = idx.searchRegex(".", { limit: 10, after: "2099-01-01T00:00:00.000Z" });
+    assert.equal(results.length, 0);
+  });
+
+  test("session_id filter works", () => {
+    const results = idx.searchRegex("migration", { limit: 10, sessionId: "session-3" });
+    for (const r of results) {
+      assert.equal(r.sessionId, "session-3");
+    }
+  });
+
+  test("invalid regex returns empty (no crash)", () => {
+    const results = idx.searchRegex("[invalid(", { limit: 5 });
+    assert.equal(results.length, 0);
+  });
+
+  test("no match returns empty", () => {
+    const results = idx.searchRegex("xyzzy9999qqq_nomatch", { limit: 5 });
+    assert.equal(results.length, 0);
+  });
+
+  test("score is 0 (no BM25 for regex)", () => {
+    const results = idx.searchRegex("Session", { limit: 1 });
+    assert.ok(results.length > 0);
+    assert.equal(results[0].score, 0);
+  });
+
+  test("includes session metadata", () => {
+    const results = idx.searchRegex("FTS5", { limit: 1 });
+    assert.ok(results.length > 0);
+    assert.ok(results[0].sessionId);
+    assert.ok(results[0].sessionFile.endsWith(".jsonl"));
+    assert.ok(results[0].timestamp);
+    assert.ok(typeof results[0].turnIndex === "number");
+  });
+});
